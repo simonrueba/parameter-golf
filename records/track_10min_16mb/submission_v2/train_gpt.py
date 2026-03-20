@@ -85,6 +85,8 @@ class Hyperparameters:
 
     # Quantization: INT4 (default) or INT8 (fallback)
     quant_bits = int(os.environ.get("QUANT_BITS", 4))
+    # Quant corrector: low-rank residual on final hidden state (0=disabled)
+    corrector_rank = int(os.environ.get("CORRECTOR_RANK", 16))
 
     # Strided eval: stride=64 matches SOTA setting
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
@@ -885,8 +887,22 @@ class Block(nn.Module):
         return x
 
 
+class QuantCorrectorModule(nn.Module):
+    """Tiny low-rank residual corrector for INT4 quantization error repair.
+    Applied after final_norm: h_final = h_q + up(down(h_q)).
+    Stored in FP16 (not quantized) — negligible size at rank 16: ~2*D*r*2 = ~40KB."""
+    def __init__(self, dim: int, rank: int):
+        super().__init__()
+        self.down = nn.Linear(dim, rank, bias=False)
+        self.up = nn.Linear(rank, dim, bias=False)
+        nn.init.zeros_(self.up.weight)  # start as identity (no correction)
+
+    def forward(self, h: Tensor) -> Tensor:
+        return h + self.up(self.down(h))
+
+
 class GPT(nn.Module):
-    """Standard N-layer GPT with U-Net skip connections."""
+    """Standard N-layer GPT with U-Net skip connections + optional quant corrector."""
 
     def __init__(
         self,
@@ -901,6 +917,7 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        corrector_rank: int = 0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -922,6 +939,7 @@ class GPT(nn.Module):
             ]
         )
         self.final_norm = RMSNorm()
+        self.corrector = QuantCorrectorModule(model_dim, corrector_rank) if corrector_rank > 0 else None
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
@@ -948,7 +966,10 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
-        x = self.final_norm(x).reshape(-1, x.size(-1))
+        x = self.final_norm(x)
+        if self.corrector is not None:
+            x = self.corrector(x)
+        x = x.reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
@@ -1069,6 +1090,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        corrector_rank=args.corrector_rank,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
