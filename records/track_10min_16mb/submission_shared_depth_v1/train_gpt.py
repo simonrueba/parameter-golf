@@ -52,7 +52,8 @@ class Hyperparameters:
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))   # 64 = proven on leaderboard
-    ema_decay = float(os.environ.get("EMA_DECAY", 0.995))
+    qat_enabled = bool(int(os.environ.get("QAT", "0")))
+    ema_decay = float(os.environ.get("EMA_DECAY", 0.0))  # 0 = disabled; 0.995 to enable
     ema_start_frac = float(os.environ.get("EMA_START_FRAC", 0.1))
     dynamic_eval = bool(int(os.environ.get("DYNAMIC_EVAL", "0")))
     dynamic_eval_lr = float(os.environ.get("DYNAMIC_EVAL_LR", 1e-3))
@@ -735,11 +736,12 @@ class RMSNorm(nn.Module):
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
 
+_QAT_ENABLED = False  # set from Hyperparameters.qat_enabled in main()
+
 class CastedLinear(nn.Linear):
-    # Weights in fp32; cast at matmul time. Fake-int8 QAT via STE during training.
     def forward(self, x: Tensor) -> Tensor:
         w = self.weight.to(x.dtype)
-        if self.training and w.ndim == 2:
+        if _QAT_ENABLED and self.training and w.ndim == 2:
             with torch.no_grad():
                 abs_max = w.abs().amax(dim=-1, keepdim=True).clamp_min(1.0 / 127.0)
                 scale = abs_max / 127.0
@@ -1011,8 +1013,10 @@ class GPT(nn.Module):
 def main() -> None:
     global zeropower_via_newtonschulz5
 
+    global _QAT_ENABLED, zeropower_via_newtonschulz5
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    _QAT_ENABLED = args.qat_enabled
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
@@ -1301,21 +1305,22 @@ def main() -> None:
 
         step += 1
 
-        step_ms = (training_time_ms + 1000.0 * (time.perf_counter() - t0)) / max(step, 1)
-        if max_wallclock_ms is not None and step_ms > 0:
-            estimated_total_steps = int(max_wallclock_ms / step_ms)
-        else:
-            estimated_total_steps = args.iterations
-        ema_start_step = int(args.ema_start_frac * estimated_total_steps)
-        if step >= ema_start_step:
-            if not ema_active:
-                ema_state = {name: param.detach().clone() for name, param in base_model.named_parameters()}
-                ema_active = True
-                log0(f"ema:started at step {step}")
+        if args.ema_decay > 0:
+            step_ms = (training_time_ms + 1000.0 * (time.perf_counter() - t0)) / max(step, 1)
+            if max_wallclock_ms is not None and step_ms > 0:
+                estimated_total_steps = int(max_wallclock_ms / step_ms)
             else:
-                with torch.no_grad():
-                    for name, param in base_model.named_parameters():
-                        ema_state[name].mul_(args.ema_decay).add_(param.detach(), alpha=1.0 - args.ema_decay)
+                estimated_total_steps = args.iterations
+            ema_start_step = int(args.ema_start_frac * estimated_total_steps)
+            if step >= ema_start_step:
+                if not ema_active:
+                    ema_state = {name: param.detach().clone() for name, param in base_model.named_parameters()}
+                    ema_active = True
+                    log0(f"ema:started at step {step}")
+                else:
+                    with torch.no_grad():
+                        for name, param in base_model.named_parameters():
+                            ema_state[name].mul_(args.ema_decay).add_(param.detach(), alpha=1.0 - args.ema_decay)
 
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
