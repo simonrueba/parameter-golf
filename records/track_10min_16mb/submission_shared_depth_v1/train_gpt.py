@@ -1,7 +1,7 @@
 """
 SharedDepthGPT: Prelude(1) + Shared(1, looped N times) + Coda(1) = 3 unique blocks.
 
-Architecture: dim=768, heads=12, kv_heads=6, mlp_mult=2, vocab=1024, tied embeddings.
+Architecture: dim=1024, heads=16, kv_heads=2, mlp_mult=2, vocab=1024, tied embeddings.
 The shared block is looped SHARED_ITERS times (default 7). Sinusoidal depth embeddings
 (non-learnable, scaled by 0.1) are added before each shared iteration so the block can
 distinguish which iteration it is on. x0 is re-injected via resid_mix at every iteration.
@@ -38,7 +38,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # -----------------------------
 # SharedDepthGPT run:
 # - 3 unique transformer blocks: prelude, shared (looped 7x), coda
-# - dim=768, 12 attention heads with 6 KV heads (GQA), 2x MLP expansion
+# - dim=1024, 16 attention heads with 2 KV heads (GQA), 2x MLP expansion
 # - vocab size 1024, sequence length 1024, tied embeddings
 # - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
 
@@ -69,9 +69,9 @@ class Hyperparameters:
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 3))       # unique layers: prelude + shared + coda
     shared_iters = int(os.environ.get("SHARED_ITERS", 7))   # how many times the shared block loops
-    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 6))
-    model_dim = int(os.environ.get("MODEL_DIM", 768))
-    num_heads = int(os.environ.get("NUM_HEADS", 12))
+    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 2))
+    model_dim = int(os.environ.get("MODEL_DIM", 1024))
+    num_heads = int(os.environ.get("NUM_HEADS", 16))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
