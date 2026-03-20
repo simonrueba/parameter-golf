@@ -105,17 +105,17 @@ class LowRankCorrector(nn.Module):
         return h + self.up(self.down(h))
 
 class GatedLowRankCorrector(nn.Module):
-    """h = h + gate(h) * up(down(h)). Selective correction: 3*D*r + r params."""
+    """h = h + gate(h) * up(down(h)). Selective correction."""
     def __init__(self, dim: int, rank: int):
         super().__init__()
         self.down = nn.Linear(dim, rank, bias=False)
         self.up = nn.Linear(rank, dim, bias=False)
-        self.gate_proj = nn.Linear(dim, rank, bias=True)
+        self.gate_proj = nn.Linear(dim, dim, bias=True)
         nn.init.zeros_(self.up.weight)
     def forward(self, h: Tensor) -> Tensor:
         delta = self.up(self.down(h))
         gate = torch.sigmoid(self.gate_proj(h))
-        return h + gate * self.up(self.down(h))
+        return h + gate * delta
 
 # ---------------------------------------------------------------------------
 # Two-point corrector: repairs at an intermediate block + final hidden state
