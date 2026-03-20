@@ -1257,11 +1257,12 @@ def main() -> None:
 
         step += 1
 
-        ema_start_step = max(1, int(args.ema_start_frac * step)) if stop_after_step is not None else int(args.ema_start_frac * args.iterations)
-        # Use wallclock-aware estimate: once we know we'll hit the cap, base EMA start on actual steps
-        if approx_training_time_ms > 0 and max_wallclock_ms is not None:
-            estimated_total_steps = int(max_wallclock_ms / (approx_training_time_ms / step))
-            ema_start_step = int(args.ema_start_frac * estimated_total_steps)
+        step_ms = (training_time_ms + 1000.0 * (time.perf_counter() - t0)) / max(step, 1)
+        if max_wallclock_ms is not None and step_ms > 0:
+            estimated_total_steps = int(max_wallclock_ms / step_ms)
+        else:
+            estimated_total_steps = args.iterations
+        ema_start_step = int(args.ema_start_frac * estimated_total_steps)
         if step >= ema_start_step:
             if not ema_active:
                 ema_state = {name: param.detach().clone() for name, param in base_model.named_parameters()}
