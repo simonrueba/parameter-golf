@@ -135,33 +135,41 @@ class TwoPointCorrector(nn.Module):
 # Forward pass with two-point correction injected
 # ---------------------------------------------------------------------------
 def forward_with_correction(
-    raw_model, x: Tensor, corrector: TwoPointCorrector | None,
-    mid_idx: int = 0,
+    raw_model, x: Tensor, corrector=None, mid_idx: int = 0,
 ) -> Tensor:
-    """Run the model forward, injecting corrections at mid_idx and final."""
-    x_emb = raw_model.tok_emb(x)
-    x_emb = F.rms_norm(x_emb, (x_emb.size(-1),))
-    x0 = x_emb
-    h = x_emb
-    skips = []
-    block_count = 0
-    for i in range(raw_model.num_encoder_layers):
-        h = raw_model.blocks[i](h, x0)
-        skips.append(h)
-        if corrector is not None and block_count == mid_idx:
-            h = corrector.mid_corrector(h)
-            skips[-1] = h  # update the skip too
-        block_count += 1
-    for i in range(raw_model.num_decoder_layers):
-        if skips:
-            h = h + raw_model.skip_weights[i].to(dtype=h.dtype)[None, None, :] * skips.pop()
-        h = raw_model.blocks[raw_model.num_encoder_layers + i](h, x0)
-        if corrector is not None and block_count == mid_idx:
-            h = corrector.mid_corrector(h)
-        block_count += 1
-    h = raw_model.final_norm(h)
+    """Run frozen backbone forward, injecting corrector at mid_idx and final.
+    Backbone runs under no_grad; only corrector outputs carry gradients."""
+    with torch.no_grad():
+        x_emb = raw_model.tok_emb(x)
+        x_emb = F.rms_norm(x_emb, (x_emb.size(-1),))
+        x0 = x_emb
+        h = x_emb
+        skips = []
+        block_count = 0
+        for i in range(raw_model.num_encoder_layers):
+            h = raw_model.blocks[i](h, x0)
+            skips.append(h)
+            block_count += 1
+            if corrector is not None and (block_count - 1) == mid_idx:
+                break
+        # Mid correction (with gradients)
+    if corrector is not None and block_count - 1 == mid_idx:
+        h = corrector.mid_corrector(h.detach().requires_grad_(True))
+        skips[-1] = h
+    # Continue backbone under no_grad
+    with torch.no_grad():
+        start_enc = block_count
+        for i in range(start_enc, raw_model.num_encoder_layers):
+            h = raw_model.blocks[i](h.detach(), x0)
+            skips.append(h)
+        for i in range(raw_model.num_decoder_layers):
+            if skips:
+                h = h + raw_model.skip_weights[i].to(dtype=h.dtype)[None, None, :] * skips.pop()
+            h = raw_model.blocks[raw_model.num_encoder_layers + i](h, x0)
+        h = raw_model.final_norm(h)
+    # Final correction (with gradients)
     if corrector is not None:
-        h = corrector.final_corrector(h)
+        h = corrector.final_corrector(h.detach().requires_grad_(True))
     return h
 
 def get_logits(raw_model, h: Tensor) -> Tensor:
@@ -307,6 +315,13 @@ def main():
     print("\n" + "=" * 70)
     print("CORRECTOR SWEEP (frozen INT4 backbone, CE-only)")
     print("=" * 70)
+
+    # Clear inference-mode cached RoPE tensors before training with gradients
+    for m in [teacher, int4_model]:
+        for block in m.blocks:
+            block.attn.rotary._cos_cached = None
+            block.attn.rotary._sin_cached = None
+            block.attn.rotary._seq_len_cached = 0
 
     n_blocks = args.num_layers
     mid_idx = 0  # earliest block — proven best placement
