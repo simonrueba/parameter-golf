@@ -42,16 +42,16 @@ class Hyperparameters:
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 3))       # prelude + shared + coda
+    num_layers = int(os.environ.get("NUM_LAYERS", 9))       # 3=shared-depth, >3=standard
     shared_iters = int(os.environ.get("SHARED_ITERS", 7))   # how many times the shared block loops
-    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 6))
-    model_dim = int(os.environ.get("MODEL_DIM", 768))
-    num_heads = int(os.environ.get("NUM_HEADS", 12))
+    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
+    model_dim = int(os.environ.get("MODEL_DIM", 512))
+    num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
-    eval_stride = int(os.environ.get("EVAL_STRIDE", 512))  # 0 = seq_len // 2
+    eval_stride = int(os.environ.get("EVAL_STRIDE", 64))   # 64 = proven on leaderboard
     ema_decay = float(os.environ.get("EMA_DECAY", 0.995))
     ema_start_frac = float(os.environ.get("EMA_START_FRAC", 0.1))
     dynamic_eval = bool(int(os.environ.get("DYNAMIC_EVAL", "0")))
@@ -348,12 +348,22 @@ def _model_per_token_loss(model: nn.Module, x: Tensor, y: Tensor) -> Tensor:
     x_emb = raw.tok_emb(x)
     x_emb = F.rms_norm(x_emb, (x_emb.size(-1),))
     x0 = x_emb
-    depth_emb = raw._depth_emb.to(device=x_emb.device, dtype=x_emb.dtype)
-    h = raw.prelude(x_emb, x0)
-    for i in range(raw.shared_iters):
-        h = h + raw.depth_scale * depth_emb[i]
-        h = raw.shared(h, x0)
-    h = raw.coda(h, x0)
+    if raw.use_shared_depth:
+        depth_emb = raw._depth_emb.to(device=x_emb.device, dtype=x_emb.dtype)
+        h = raw.prelude(x_emb, x0)
+        for i in range(raw.shared_iters):
+            h = h + raw.depth_scale * depth_emb[i]
+            h = raw.shared(h, x0)
+        h = raw.coda(h, x0)
+    else:
+        h, skips_h = x_emb, []
+        for i in range(raw.num_encoder_layers):
+            h = raw.blocks[i](h, x0)
+            skips_h.append(h)
+        for i in range(raw.num_decoder_layers):
+            if skips_h:
+                h = h + raw.skip_weights[i].to(dtype=h.dtype)[None, None, :] * skips_h.pop()
+            h = raw.blocks[raw.num_encoder_layers + i](h, x0)
     h = raw.final_norm(h).reshape(-1, h.size(-1))
     logits_proj = F.linear(h, raw.tok_emb.weight) if raw.tie_embeddings else raw.lm_head(h)
     logits = raw.logit_softcap * torch.tanh(logits_proj / raw.logit_softcap)
@@ -386,8 +396,12 @@ def eval_val_dynamic(
         raw = raw._orig_mod
     lora_layers: list[LoRALayer] = []
     original_modules: list[tuple[nn.Module, str, nn.Module]] = []
-    for block_name in ["prelude", "shared", "coda"]:
-        block = getattr(raw, block_name)
+    blocks_to_wrap = []
+    if raw.use_shared_depth:
+        blocks_to_wrap = [raw.prelude, raw.shared, raw.coda]
+    else:
+        blocks_to_wrap = list(raw.blocks)
+    for block in blocks_to_wrap:
         for proj_name in ["c_q", "c_k", "c_v", "proj"]:
             base_linear = getattr(block.attn, proj_name)
             lora = LoRALayer(base_linear, rank=lora_rank).to(device)
@@ -449,12 +463,23 @@ def eval_val_dynamic(
                 x_emb = raw.tok_emb(x_in)
                 x_emb = F.rms_norm(x_emb, (x_emb.size(-1),))
                 x0 = x_emb
-                depth_emb = raw._depth_emb.to(device=x_emb.device, dtype=x_emb.dtype)
-                h = raw.prelude(x_emb, x0)
-                for i in range(raw.shared_iters):
-                    h = h + raw.depth_scale * depth_emb[i]
-                    h = raw.shared(h, x0)
-                h = raw.coda(h, x0)
+                if raw.use_shared_depth:
+                    depth_emb = raw._depth_emb.to(device=x_emb.device, dtype=x_emb.dtype)
+                    h = raw.prelude(x_emb, x0)
+                    for i in range(raw.shared_iters):
+                        h = h + raw.depth_scale * depth_emb[i]
+                        h = raw.shared(h, x0)
+                    h = raw.coda(h, x0)
+                else:
+                    h = x_emb
+                    skips_d: list[Tensor] = []
+                    for i in range(raw.num_encoder_layers):
+                        h = raw.blocks[i](h, x0)
+                        skips_d.append(h)
+                    for i in range(raw.num_decoder_layers):
+                        if skips_d:
+                            h = h + raw.skip_weights[i].to(dtype=h.dtype)[None, None, :] * skips_d.pop()
+                        h = raw.blocks[raw.num_encoder_layers + i](h, x0)
                 h_flat = raw.final_norm(h).reshape(-1, h.size(-1))
                 if raw.tie_embeddings:
                     logits_proj = F.linear(h_flat, raw.tok_emb.weight)
@@ -885,12 +910,12 @@ class LoRALayer(nn.Module):
 
 
 class GPT(nn.Module):
-    """SharedDepthGPT: Prelude + Shared (looped shared_iters times) + Coda = 3 unique blocks."""
+    """Supports two modes: shared-depth (num_layers=3) or standard (num_layers>3)."""
 
     def __init__(
         self,
         vocab_size: int,
-        num_layers: int,  # kept for API compatibility; must equal 3
+        num_layers: int,
         model_dim: int,
         num_heads: int,
         num_kv_heads: int,
@@ -905,37 +930,41 @@ class GPT(nn.Module):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
-        if num_layers != 3:
-            raise ValueError(
-                f"SharedDepthGPT requires num_layers=3 (prelude+shared+coda), got {num_layers}"
-            )
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
-        self.shared_iters = shared_iters
+        self.shared_iters = shared_iters if num_layers == 3 else 0
+        self.use_shared_depth = (num_layers == 3)
         self.depth_scale = 0.1
 
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        block_kwargs = dict(dim=model_dim, num_heads=num_heads, num_kv_heads=num_kv_heads,
+                            mlp_mult=mlp_mult, rope_base=rope_base, qk_gain_init=qk_gain_init)
 
-        block_kwargs = dict(
-            dim=model_dim,
-            num_heads=num_heads,
-            num_kv_heads=num_kv_heads,
-            mlp_mult=mlp_mult,
-            rope_base=rope_base,
-            qk_gain_init=qk_gain_init,
-        )
-        self.prelude = Block(**block_kwargs)
-        self.shared = Block(**block_kwargs)
-        self.coda = Block(**block_kwargs)
+        if self.use_shared_depth:
+            self.prelude = Block(**block_kwargs)
+            self.shared = Block(**block_kwargs)
+            self.coda = Block(**block_kwargs)
+            self.blocks = nn.ModuleList()  # empty, not used
+            self.skip_weights = nn.Parameter(torch.empty(0))
+            depth_emb = _make_sinusoidal_depth_emb(shared_iters, model_dim)
+            self.register_buffer("_depth_emb", depth_emb, persistent=False)
+        else:
+            # Standard baseline architecture with U-Net skip connections
+            self.prelude = None
+            self.shared = None
+            self.coda = None
+            self.blocks = nn.ModuleList([Block(**block_kwargs) for _ in range(num_layers)])
+            self.num_encoder_layers = num_layers // 2
+            self.num_decoder_layers = num_layers - self.num_encoder_layers
+            self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
+            self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+            self.register_buffer("_depth_emb", torch.empty(0), persistent=False)
 
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
-        depth_emb = _make_sinusoidal_depth_emb(shared_iters, model_dim)
-        self.register_buffer("_depth_emb", depth_emb, persistent=False)
-
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -950,12 +979,22 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
 
-        depth_emb = self._depth_emb.to(dtype=x.dtype)
-        x = self.prelude(x, x0)
-        for i in range(self.shared_iters):
-            x = x + self.depth_scale * depth_emb[i]
-            x = self.shared(x, x0)
-        x = self.coda(x, x0)
+        if self.use_shared_depth:
+            depth_emb = self._depth_emb.to(dtype=x.dtype)
+            x = self.prelude(x, x0)
+            for i in range(self.shared_iters):
+                x = x + self.depth_scale * depth_emb[i]
+                x = self.shared(x, x0)
+            x = self.coda(x, x0)
+        else:
+            skips: list[Tensor] = []
+            for i in range(self.num_encoder_layers):
+                x = self.blocks[i](x, x0)
+                skips.append(x)
+            for i in range(self.num_decoder_layers):
+                if skips:
+                    x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                x = self.blocks[self.num_encoder_layers + i](x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -1073,9 +1112,14 @@ def main() -> None:
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     all_block_named_params: list[tuple[str, nn.Parameter]] = []
-    for prefix, block in [("prelude", base_model.prelude), ("shared", base_model.shared), ("coda", base_model.coda)]:
-        for name, param in block.named_parameters():
-            all_block_named_params.append((f"{prefix}.{name}", param))
+    if base_model.use_shared_depth:
+        for prefix, block in [("prelude", base_model.prelude), ("shared", base_model.shared), ("coda", base_model.coda)]:
+            for name, param in block.named_parameters():
+                all_block_named_params.append((f"{prefix}.{name}", param))
+    else:
+        all_block_named_params = list(base_model.blocks.named_parameters())
+        if base_model.skip_weights.numel() > 0:
+            all_block_named_params.append(("skip_weights", base_model.skip_weights))
 
     matrix_params = [
         p
@@ -1124,13 +1168,14 @@ def main() -> None:
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
-    log0(f"architecture:SharedDepthGPT shared_iters:{args.shared_iters} unique_blocks:3")
+    arch_mode = f"SharedDepthGPT shared_iters:{args.shared_iters} unique_blocks:3" if base_model.use_shared_depth else f"StandardGPT num_layers:{args.num_layers}"
+    log0(f"architecture:{arch_mode}")
+    log0(f"model_dim:{args.model_dim} num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads} mlp_mult:{args.mlp_mult}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
-    log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
-    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(f"qat:enabled ema_decay:{args.ema_decay} ema_start_frac:{args.ema_start_frac}")
+    log0(f"eval_stride:{args.eval_stride} dynamic_eval:{args.dynamic_eval}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
-        f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
@@ -1138,7 +1183,6 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
-    log0(f"eval_stride:{args.eval_stride}")
     log0(f"seed:{args.seed}")
 
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
