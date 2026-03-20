@@ -54,7 +54,7 @@ class Hyperparameters:
     eval_stride = int(os.environ.get("EVAL_STRIDE", 512))  # 0 = seq_len // 2
     ema_decay = float(os.environ.get("EMA_DECAY", 0.995))
     ema_start_frac = float(os.environ.get("EMA_START_FRAC", 0.1))
-    dynamic_eval = bool(int(os.environ.get("DYNAMIC_EVAL", "1")))
+    dynamic_eval = bool(int(os.environ.get("DYNAMIC_EVAL", "0")))
     dynamic_eval_lr = float(os.environ.get("DYNAMIC_EVAL_LR", 1e-3))
     dynamic_eval_lora_rank = int(os.environ.get("DYNAMIC_EVAL_LORA_RANK", 4))
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -1257,7 +1257,11 @@ def main() -> None:
 
         step += 1
 
-        ema_start_step = int(args.ema_start_frac * args.iterations)
+        ema_start_step = max(1, int(args.ema_start_frac * step)) if stop_after_step is not None else int(args.ema_start_frac * args.iterations)
+        # Use wallclock-aware estimate: once we know we'll hit the cap, base EMA start on actual steps
+        if approx_training_time_ms > 0 and max_wallclock_ms is not None:
+            estimated_total_steps = int(max_wallclock_ms / (approx_training_time_ms / step))
+            ema_start_step = int(args.ema_start_frac * estimated_total_steps)
         if step >= ema_start_step:
             if not ema_active:
                 ema_state = {name: param.detach().clone() for name, param in base_model.named_parameters()}
